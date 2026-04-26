@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+
+# Backups created by the auto-updater
+*.bak
+*.new
+*.orig
+
+# Capture artefacts (must never be committed — may contain customer traffic)
+*.pcap
+*.pcapng
+*.cap
+
+# Local credentials cache the script writes
+dn_devices.json
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
