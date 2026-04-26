@@ -32,9 +32,9 @@ MIN_FREE_GB = int(os.environ.get("DN_MIN_FREE_GB", "15"))
 # Disable the check entirely by exporting DN_SKIP_UPDATE_CHECK=1.
 # ---------------------------------------------------------------------------
 __version__ = "2026.04.25.5"
-UPDATE_SERVER = "zkeiserman-dev"
+UPDATE_SERVER = os.environ.get("DN_SERVER_HOST", "zkeiserman-dev")
 UPDATE_USER = "dn"
-UPDATE_PASS = "Drive1234!"
+UPDATE_PASS = os.environ.get("DN_SERVER_PASSWORD", "")
 UPDATE_REMOTE_SCRIPT = "/home/dn/dn_capture.py"
 UPDATE_REMOTE_CHANGELOG = "/home/dn/dn_capture_CHANGELOG.txt"
 
@@ -344,9 +344,9 @@ def get_connection_details(mode='datapath', deployment='standalone', ncp='0'):
             'device_host': device_host,
             'device_user': device_user,
             'device_pass': device_pass,
-            'server_host': "zkeiserman-dev",
+            'server_host': os.environ.get("DN_SERVER_HOST", "zkeiserman-dev"),
             'server_user': "dn",
-            'server_pass': "Drive1234!",
+            'server_pass': os.environ.get("DN_SERVER_PASSWORD", ""),
             'server_path': "/home/dn/capture"
         }
     
@@ -358,9 +358,9 @@ def get_connection_details(mode='datapath', deployment='standalone', ncp='0'):
         'device_host': 'YC71F5VJ00008P2',
         'device_user': 'dnroot',
         'device_pass': 'dnroot',
-        'server_host': "zkeiserman-dev",
+        'server_host': os.environ.get("DN_SERVER_HOST", "zkeiserman-dev"),
         'server_user': "dn",
-        'server_pass': "Drive1234!",
+        'server_pass': os.environ.get("DN_SERVER_PASSWORD", ""),
         'server_path': "/home/dn/capture"
     }
 
@@ -516,9 +516,9 @@ def datapath_capture(device_host, device_user, device_pass, deployment, ncp):
         'device_host': device_host,
         'device_user': device_user,
         'device_pass': device_pass,
-        'server_host': "zkeiserman-dev",
+        'server_host': os.environ.get("DN_SERVER_HOST", "zkeiserman-dev"),
         'server_user': "dn",
-        'server_pass': "Drive1234!",
+        'server_pass': os.environ.get("DN_SERVER_PASSWORD", ""),
         'server_path': "/home/dn/capture"
     }
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1011,7 +1011,7 @@ def routing_engine_capture(device_host, device_user, device_pass):
         'device_pass': device_pass,
         'server_host': "10.10.75.210",
         'server_user': "dn",
-        'server_pass': "Drive1234!",
+        'server_pass': os.environ.get("DN_SERVER_PASSWORD", ""),
         'server_path': "/home/dn"
     }
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
