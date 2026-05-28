@@ -12,6 +12,10 @@ import re
 
 # Credentials file path
 CREDS_FILE = os.path.expanduser("~/Downloads/dn_devices.json")
+DN_QA_ENV = os.path.expanduser("~/.dn_qa_env")
+DEFAULT_SERVER_USER = "dn"
+SERVER_PATH_DATAPATH = "/home/dn/capture"
+SERVER_PATH_ROUTING = "/home/dn"
 
 # Maximum pcap size (MB). Capture is stopped early when the file on the device
 # crosses this threshold so a runaway capture cannot fill /tmp and break the
@@ -31,7 +35,7 @@ MIN_FREE_GB = int(os.environ.get("DN_MIN_FREE_GB", "15"))
 #   dn@zkeiserman-dev:/home/dn/dn_capture_CHANGELOG.txt
 # Disable the check entirely by exporting DN_SKIP_UPDATE_CHECK=1.
 # ---------------------------------------------------------------------------
-__version__ = "2026.04.25.5"
+__version__ = "2026.05.28.1"
 UPDATE_SERVER = os.environ.get("DN_SERVER_HOST", "zkeiserman-dev")
 UPDATE_USER = "dn"
 UPDATE_PASS = os.environ.get("DN_SERVER_PASSWORD", "")
@@ -47,14 +51,29 @@ def _is_master_host():
         return False
 
 
+def _connect_update_server(timeout=5):
+    """SSH to the dev VM hosting the master copy (keys first, password fallback)."""
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    kwargs = dict(
+        hostname=UPDATE_SERVER,
+        username=UPDATE_USER,
+        timeout=timeout,
+        banner_timeout=timeout,
+        auth_timeout=timeout,
+        look_for_keys=True,
+        allow_agent=True,
+    )
+    if UPDATE_PASS:
+        kwargs["password"] = UPDATE_PASS
+    client.connect(**kwargs)
+    return client
+
+
 def _fetch_remote_version_and_changelog():
     """Return (remote_version, changelog_text) or (None, None) on any failure."""
     try:
-        client = paramiko.SSHClient()
-        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        client.connect(UPDATE_SERVER, username=UPDATE_USER, password=UPDATE_PASS,
-                       look_for_keys=False, allow_agent=False, timeout=5,
-                       banner_timeout=5, auth_timeout=5)
+        client = _connect_update_server(timeout=5)
         _, stdout, _ = client.exec_command(
             f"grep -m1 '^__version__' {UPDATE_REMOTE_SCRIPT}")
         ver_line = stdout.read().decode(errors='ignore').strip()
@@ -75,10 +94,7 @@ def _install_update():
         backup = local + ".bak"
         new = local + ".new"
 
-        client = paramiko.SSHClient()
-        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        client.connect(UPDATE_SERVER, username=UPDATE_USER, password=UPDATE_PASS,
-                       look_for_keys=False, allow_agent=False, timeout=15)
+        client = _connect_update_server(timeout=15)
         sftp = client.open_sftp()
         sftp.get(UPDATE_REMOTE_SCRIPT, new)
         sftp.close()
@@ -119,17 +135,12 @@ def _check_for_update():
         for line in changelog.splitlines()[:30]:
             print(f"  {line}")
         print("  --- end of changelog ---\n")
-    try:
-        choice = input("Install this update now? (y/n) [y]: ").strip().lower()
-    except (KeyboardInterrupt, EOFError):
-        print("\n  Skipping update.")
-        return
-    if choice in ('', 'y', 'yes'):
-        if _install_update():
-            print("  Re-launching with the new version...\n")
-            os.execv(sys.executable, [sys.executable] + sys.argv)
+    print("  Installing update...")
+    if _install_update():
+        print("  Re-launching with the new version...\n")
+        os.execv(sys.executable, [sys.executable] + sys.argv)
     else:
-        print("  Skipping update. (Set DN_SKIP_UPDATE_CHECK=1 to silence this prompt.)")
+        print("  Update failed; continuing with current version.")
 
 def load_saved_settings():
     """Load last used settings"""
@@ -165,6 +176,205 @@ def save_settings(mode, deployment, ncp, device_host, device_user, device_pass):
             json.dump(data, f, indent=2)
     except:
         pass
+
+def _load_dotenv_file(path):
+    """Load export KEY=VALUE lines into os.environ (only if not already set)."""
+    if not os.path.exists(path):
+        return
+    try:
+        with open(path, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                if line.startswith('export '):
+                    line = line[7:].strip()
+                if '=' not in line:
+                    continue
+                key, _, value = line.partition('=')
+                key = key.strip()
+                value = value.strip().strip('"').strip("'")
+                if key and key not in os.environ:
+                    os.environ[key] = value
+    except Exception:
+        pass
+
+
+def _read_creds_file():
+    try:
+        if os.path.exists(CREDS_FILE):
+            with open(CREDS_FILE, 'r') as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
+
+
+# Hostnames / FQDNs / IPv4 literals only use these characters. We deliberately
+# do NOT allow ':' / '!' / '@' / '/' / whitespace because the most common way
+# the cache gets poisoned is a user typing a password into the host prompt.
+_VALID_HOST_RE = re.compile(r'^[A-Za-z0-9._-]+$')
+
+
+def _is_valid_host(value):
+    """True if value looks like a plausible hostname/FQDN/IPv4 literal."""
+    if not value or not isinstance(value, str):
+        return False
+    value = value.strip()
+    if not value or len(value) > 253:
+        return False
+    return bool(_VALID_HOST_RE.match(value))
+
+
+def load_server_config_from_file():
+    return _read_creds_file().get('server_config') or {}
+
+
+def save_server_config(server_host, server_pass, server_user=DEFAULT_SERVER_USER):
+    """Persist dev VM upload target for next run."""
+    try:
+        data = _read_creds_file()
+        data['server_config'] = {
+            'server_host': server_host,
+            'server_user': server_user,
+            'server_pass': server_pass,
+            'timestamp': datetime.now().isoformat(),
+        }
+        with open(CREDS_FILE, 'w') as f:
+            json.dump(data, f, indent=2)
+    except Exception:
+        pass
+
+
+def reset_server_config():
+    """Wipe the cached server_config key from ~/Downloads/dn_devices.json.
+
+    Escape hatch for users whose cache got poisoned (e.g. a password typed
+    into the host prompt by accident). Triggered by DN_RESET_SERVER_CONFIG=1.
+    """
+    try:
+        if not os.path.exists(CREDS_FILE):
+            print("No cached server_config to reset.")
+            return
+        data = _read_creds_file()
+        if 'server_config' not in data:
+            print("No cached server_config to reset.")
+            return
+        del data['server_config']
+        with open(CREDS_FILE, 'w') as f:
+            json.dump(data, f, indent=2)
+        print("Cleared cached server_config from ~/Downloads/dn_devices.json.")
+    except Exception as e:
+        print(f"Could not reset server_config: {e}")
+
+
+def resolve_server_config(server_path, prompt_if_missing=True):
+    """Dev VM used for device->server scp and Mac download. Never hardcodes passwords."""
+    _load_dotenv_file(DN_QA_ENV)
+
+    saved = load_server_config_from_file()
+    saved_host = saved.get('server_host') or ""
+    # Treat a cached host that looks like junk (e.g. a password mistyped into
+    # the host prompt on a previous run) as if it were never set, so we
+    # re-prompt instead of silently reusing garbage forever.
+    if saved_host and not _is_valid_host(saved_host):
+        print(f"Ignoring invalid cached dev VM host: {saved_host!r}")
+        saved_host = ""
+
+    host = (os.environ.get("DN_SERVER_HOST") or
+            os.environ.get("DN_DEV_VM_HOST") or
+            saved_host or "")
+    password = (os.environ.get("DN_SERVER_PASSWORD") or
+                os.environ.get("DN_DEV_VM_PASSWORD") or
+                saved.get('server_pass') or "")
+    user = (os.environ.get("DN_SERVER_USER") or
+            os.environ.get("DN_DEV_VM_USER") or
+            saved.get('server_user') or
+            DEFAULT_SERVER_USER)
+
+    if host and not _is_valid_host(host):
+        # Env-var override is bogus too; force a prompt.
+        print(f"Ignoring invalid DN_SERVER_HOST/DN_DEV_VM_HOST value: {host!r}")
+        host = ""
+
+    if prompt_if_missing and not host:
+        default_host = UPDATE_SERVER if _is_valid_host(UPDATE_SERVER) else "zkeiserman-dev"
+        for _ in range(3):
+            entered = input(f"\nDev VM for pcap upload [{default_host}]: ").strip() or default_host
+            if _is_valid_host(entered):
+                host = entered
+                break
+            print(f"  '{entered}' does not look like a hostname. "
+                  "Allowed chars: letters, digits, '.', '_', '-'. Try again.")
+        else:
+            print("Giving up after 3 invalid attempts. Re-run when ready.")
+            sys.exit(1)
+
+    if prompt_if_missing and not password:
+        print("Dev VM password (for scp from device; stored in ~/Downloads/dn_devices.json):")
+        password = getpass.getpass("Password: ") or ""
+
+    if host and password and _is_valid_host(host):
+        save_server_config(host, password, user)
+
+    return {
+        'server_host': host,
+        'server_user': user,
+        'server_pass': password,
+        'server_path': server_path,
+    }
+
+
+def ensure_server_staging_dir(config):
+    """Create upload directory on dev VM before capture starts."""
+    host = config['server_host']
+    path = config['server_path']
+    user = config['server_user']
+    password = config.get('server_pass') or None
+
+    try:
+        r = subprocess.run(
+            ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10',
+             f'{user}@{host}', f'mkdir -p {path}'],
+            capture_output=True, text=True, timeout=20)
+        if r.returncode == 0:
+            return True
+    except Exception:
+        pass
+
+    try:
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        client.connect(host, username=user, password=password,
+                       look_for_keys=True, allow_agent=True, timeout=15)
+        client.exec_command(f'mkdir -p {path}')
+        client.close()
+        return True
+    except Exception as e:
+        print(f"⚠ Could not prepare {user}@{host}:{path} - {e}")
+        return False
+
+
+def verify_file_on_server(config, filename):
+    """Check that the pcap landed on the dev VM."""
+    host = config['server_host']
+    user = config['server_user']
+    path = config['server_path']
+    password = config.get('server_pass') or None
+    remote = f'{path}/{filename}'
+
+    try:
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        client.connect(host, username=user, password=password,
+                       look_for_keys=True, allow_agent=True, timeout=15)
+        _, stdout, _ = client.exec_command(f'test -s {remote} && echo OK')
+        ok = 'OK' in stdout.read().decode(errors='ignore')
+        client.close()
+        return ok
+    except Exception:
+        return False
+
 
 def detect_deployment_type(ssh_client):
     """Auto-detect if system is Standalone or Cluster"""
@@ -327,6 +537,83 @@ def detect_ncp_from_port_mirroring(ssh_client):
         traceback.print_exc()
         return None
 
+
+def prompt_capture_mode():
+    """Ask whether to capture from datapath or routing engine."""
+    print("\nCapture from:")
+    print("  1. Datapath")
+    print("  2. Routing Engine")
+    mode_choice = input("Select (1=Datapath, 2=Routing Engine): ").strip()
+    return 'routing' if mode_choice == '2' else 'datapath'
+
+
+def prompt_deployment_type():
+    """Ask whether the device is standalone or cluster."""
+    print("Deployment type:")
+    print("  1. Standalone")
+    print("  2. Cluster")
+    deployment_choice = input("Select (1=Standalone, 2=Cluster): ").strip()
+    return 'cluster' if deployment_choice == '2' else 'standalone'
+
+
+def resolve_ncp_for_datapath(device_host, device_user, device_pass, deployment):
+    """Auto-detect or prompt for NCP number (datapath cluster only)."""
+    if deployment == 'standalone':
+        return '0'
+    try:
+        temp_ssh = paramiko.SSHClient()
+        temp_ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        temp_ssh.connect(device_host, username=device_user, password=device_pass, timeout=10)
+        ncp = detect_ncp_from_port_mirroring(temp_ssh)
+        temp_ssh.close()
+        if not ncp:
+            print("\nNCP auto-detection failed. Please enter manually.")
+            ncp = input("Which NCP number? (e.g., 0, 1, 2, 6, 18): ").strip() or "0"
+        return ncp
+    except Exception as e:
+        print(f"\n⚠ NCP auto-detection failed: {e}")
+        return input("Which NCP number? (e.g., 0, 1, 2, 6, 18): ").strip() or "0"
+
+
+ROUTING_ENGINE_CONTAINER_RE = re.compile(
+    r'([\w-]+_routing-engine\.[a-z0-9]+\.[a-z0-9]+)',
+    re.IGNORECASE,
+)
+
+
+def find_routing_engine_container(docker_output, device_host=None):
+    """Find routing-engine container from docker ps output.
+
+    Container names use the device serial (e.g. CZ22500CW4_routing-engine...),
+    not the management IP. When device_host is an IP, fall back to any
+    routing-engine container in the output.
+    """
+    if device_host:
+        prefix_pattern = re.compile(
+            re.escape(device_host) + r'_routing-engine\.[a-z0-9]+\.[a-z0-9]+',
+            re.IGNORECASE,
+        )
+        match = prefix_pattern.search(docker_output)
+        if match:
+            return match.group(0)
+
+    matches = []
+    for m in ROUTING_ENGINE_CONTAINER_RE.findall(docker_output):
+        if m not in matches:
+            matches.append(m)
+
+    if len(matches) == 1:
+        if device_host:
+            print(f"  (container name uses serial, not {device_host})")
+        return matches[0]
+    if len(matches) > 1:
+        print(f"⚠ Multiple routing-engine containers found, using: {matches[0]}")
+        for name in matches:
+            print(f"    {name}")
+        return matches[0]
+    return None
+
+
 def get_connection_details(mode='datapath', deployment='standalone', ncp='0'):
     """Get device connection details (mode already selected in main)"""
     # Load last settings to retrieve stored credentials
@@ -400,10 +687,36 @@ def fast_download(filename, config):
         downloads_path = get_downloads_folder()
         local_file = f"{downloads_path}/{filename}"
         download_timeout = 60
+        remote = (f'{config["server_user"]}@{config["server_host"]}:'
+                  f'{config["server_path"]}/{filename}')
 
         rsync_available = subprocess.run(
             "command -v rsync", shell=True, capture_output=True
         ).returncode == 0
+
+        # Try SSH keys first (no password prompt on Mac). Force BatchMode so
+        # ssh cannot grab /dev/tty and prompt the user interactively when no
+        # keys are set up; we want this attempt to fail fast and fall through
+        # to the expect-based password path below.
+        if rsync_available:
+            key_cmd = ['rsync', '-a', '--remove-source-files',
+                       '-e', 'ssh -o BatchMode=yes -o StrictHostKeyChecking=no',
+                       remote, f'{downloads_path}/']
+        else:
+            key_cmd = ['scp', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=no',
+                       f'{config["server_user"]}@{config["server_host"]}:'
+                       f'{config["server_path"]}/{filename}',
+                       f'{downloads_path}/']
+        r = subprocess.run(key_cmd, capture_output=True, text=True,
+                           timeout=download_timeout)
+        if os.path.exists(local_file) and os.path.getsize(local_file) > 24:
+            mode = "rsync+key" if rsync_available else "scp+key"
+            print(f"Downloaded to: {local_file}  [via {mode}]")
+            return True
+
+        if not config.get('server_pass'):
+            print("Download failed (try: export DN_SERVER_PASSWORD or re-run to save dev VM password)")
+            return False
 
         if rsync_available:
             rsync_cmd = (
@@ -470,7 +783,8 @@ expect {{
     except:
         pass
 
-def datapath_capture(device_host, device_user, device_pass, deployment, ncp):
+def datapath_capture(device_host, device_user, device_pass, deployment, ncp,
+                     server_config=None):
     """Datapath capture (original standalone + cluster support)"""
     if len(sys.argv) < 2 or len(sys.argv) > 3:
         print("Usage: python3 dn_capture.py [filename_prefix] [duration_seconds]")
@@ -516,10 +830,7 @@ def datapath_capture(device_host, device_user, device_pass, deployment, ncp):
         'device_host': device_host,
         'device_user': device_user,
         'device_pass': device_pass,
-        'server_host': os.environ.get("DN_SERVER_HOST", "zkeiserman-dev"),
-        'server_user': "dn",
-        'server_pass': os.environ.get("DN_SERVER_PASSWORD", ""),
-        'server_path': "/home/dn/capture"
+        **(server_config or resolve_server_config(SERVER_PATH_DATAPATH, prompt_if_missing=False)),
     }
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     pcap_filename = f"{filename_prefix}_{timestamp}.pcap"
@@ -845,21 +1156,28 @@ def datapath_capture(device_host, device_user, device_pass, deployment, ncp):
         show_progress(90)
         upload_success = False
         upload_start_time = time.time()
-        max_upload_time = 30
+        max_upload_time = 60
+        upload_log = ""
         
         while time.time() - upload_start_time < max_upload_time:
             if shell.recv_ready():
-                chunk = shell.recv(2048).decode()
+                chunk = shell.recv(2048).decode(errors='ignore')
+                upload_log += chunk
                 
                 if "password:" in chunk.lower() or "Password:" in chunk:
-                    shell.send(f"{config['server_pass']}\n")
+                    if config['server_pass']:
+                        shell.send(f"{config['server_pass']}\n")
+                    else:
+                        print("\n⚠ Dev VM asked for password but none configured")
+                        break
                 
                 if "100%" in chunk:
                     upload_success = True
                     show_progress(95)
                     break
                     
-                if "No such file" in chunk or "denied" in chunk.lower() or "failed" in chunk.lower():
+                if ("No such file" in chunk or "denied" in chunk.lower() or
+                        "failed" in chunk.lower() or "permission denied" in chunk.lower()):
                     break
                     
                 if "#" in chunk and ("oob_n" in chunk or "root@" in chunk):
@@ -869,9 +1187,8 @@ def datapath_capture(device_host, device_user, device_pass, deployment, ncp):
             else:
                 time.sleep(0.2)
         
-        if not upload_success and time.time() - upload_start_time >= max_upload_time:
-            show_progress(95)
-            upload_success = True
+        if not upload_success:
+            upload_success = verify_file_on_server(config, pcap_filename)
         
         # Complete (100%)
         show_progress(100)
@@ -925,7 +1242,16 @@ def datapath_capture(device_host, device_user, device_pass, deployment, ncp):
             else:
                 print("Download failed - files on server")
         else:
-            print(f"\nUpload may have failed")
+            print(f"\nUpload failed")
+            print(f"  Target: {config['server_user']}@{config['server_host']}:{config['server_path']}/")
+            if not config.get('server_pass'):
+                print("  Cause: no dev VM password configured")
+                print("  Fix: re-run and enter dev VM password when prompted,")
+                print("       or export DN_SERVER_PASSWORD / DN_DEV_VM_PASSWORD")
+            for line in upload_log.splitlines():
+                s = line.strip()
+                if s and any(k in s.lower() for k in ('denied', 'failed', 'error', 'refused', 'password')):
+                    print(f"  scp: {s}")
         
         try:
             shell.close()
@@ -966,7 +1292,7 @@ def datapath_capture(device_host, device_user, device_pass, deployment, ncp):
         print(f"\nError: {e}")
         sys.exit(1)
 
-def routing_engine_capture(device_host, device_user, device_pass):
+def routing_engine_capture(device_host, device_user, device_pass, server_config=None):
     """Routing engine capture (original RE code)"""
     if len(sys.argv) < 2 or len(sys.argv) > 3:
         print("Usage: python3 dn_capture.py [filename_prefix] [duration_seconds]")
@@ -1009,10 +1335,7 @@ def routing_engine_capture(device_host, device_user, device_pass):
         'device_host': device_host,
         'device_user': device_user,
         'device_pass': device_pass,
-        'server_host': "10.10.75.210",
-        'server_user': "dn",
-        'server_pass': os.environ.get("DN_SERVER_PASSWORD", ""),
-        'server_path': "/home/dn"
+        **(server_config or resolve_server_config(SERVER_PATH_ROUTING, prompt_if_missing=False)),
     }
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     pcap_filename = f"{filename_prefix}_{timestamp}.pcap"
@@ -1076,14 +1399,17 @@ def routing_engine_capture(device_host, device_user, device_pass):
             docker_output += shell.recv(4096).decode(errors='ignore')
             time.sleep(0.1)
         
-        pattern = f"{config['device_host']}_routing-engine\\.[a-z0-9]+\\.[a-z0-9]+"
-        match = re.search(pattern, docker_output)
+        container_name = find_routing_engine_container(
+            docker_output, config['device_host'])
         
-        if match:
-            container_name = match.group(0)
+        if container_name:
             print(f"Container: {container_name}")
         else:
             print(f"ERROR: Container not found")
+            if docker_output.strip():
+                print("  docker ps output:")
+                for line in docker_output.strip().splitlines()[:5]:
+                    print(f"    {line.strip()}")
             ssh.close()
             return
         
@@ -1128,10 +1454,16 @@ def routing_engine_capture(device_host, device_user, device_pass):
                 time.sleep(2)
         else:
             print(f"\nCapturing for {duration}s...")
-            for sec in range(duration):
-                print(f"\rProgress: {sec+1}/{duration}s", end='', flush=True)
-                time.sleep(1)
-            print()
+            try:
+                for sec in range(duration):
+                    print(f"\rProgress: {sec+1}/{duration}s", end='', flush=True)
+                    time.sleep(1)
+                print()
+            except KeyboardInterrupt:
+                print(f"\nStopping...")
+                shell.send('\x03')
+                time.sleep(2)
+                raise
         
         # Wait for file
         print("Waiting for file...")
@@ -1164,23 +1496,42 @@ def routing_engine_capture(device_host, device_user, device_pass):
         time.sleep(0.5)
         
         upload_success = False
+        upload_log = ""
         start_time = time.time()
         
         while time.time() - start_time < 60:
             if shell.recv_ready():
                 chunk = shell.recv(4096).decode(errors='ignore')
+                upload_log += chunk
                 
                 if "password:" in chunk.lower():
-                    shell.send(f"{config['server_pass']}\n")
+                    if config['server_pass']:
+                        shell.send(f"{config['server_pass']}\n")
+                    else:
+                        print("\n⚠ Dev VM asked for password but none configured")
+                        break
                 
                 if "100%" in chunk or "#" in chunk:
                     upload_success = True
+                    break
+                if ("denied" in chunk.lower() or "failed" in chunk.lower() or
+                        "refused" in chunk.lower()):
                     break
             else:
                 time.sleep(0.2)
         
         if not upload_success:
+            upload_success = verify_file_on_server(config, pcap_filename)
+        
+        if not upload_success:
             print("ERROR: Upload failed")
+            print(f"  Target: {config['server_user']}@{config['server_host']}:{config['server_path']}/")
+            if not config.get('server_pass'):
+                print("  Cause: no dev VM password configured")
+            for line in upload_log.splitlines():
+                s = line.strip()
+                if s and any(k in s.lower() for k in ('denied', 'failed', 'error', 'refused')):
+                    print(f"  scp: {s}")
             ssh.close()
             return
         
@@ -1195,25 +1546,17 @@ def routing_engine_capture(device_host, device_user, device_pass):
         # Download
         print("Downloading to Mac...")
         
-        downloads_path = os.path.expanduser("~/Downloads")
+        downloads_path = get_downloads_folder()
         local_file = f"{downloads_path}/{pcap_filename}"
         
-        scp_dl = f'scp {config["server_user"]}@{config["server_host"]}:{config["server_path"]}/{pcap_filename} "{downloads_path}/"'
+        download_success = fast_download(pcap_filename, config)
         
-        # Try expect
-        expect_script = f'''
-expect -c "
-set timeout 60
-spawn {scp_dl}
-expect {{
-    \\"password:\\" {{ send \\"{config["server_pass"]}\\r\\"; exp_continue }}
-    eof
-}}
-"
-'''
-        subprocess.run(expect_script, shell=True, capture_output=True, timeout=90)
+        if not download_success:
+            print("Retrying download...")
+            time.sleep(2)
+            download_success = fast_download(pcap_filename, config)
         
-        if os.path.exists(local_file) and os.path.getsize(local_file) > 24:
+        if download_success and os.path.exists(local_file) and os.path.getsize(local_file) > 24:
             print(f"Downloaded!")
             
             # Open Wireshark
@@ -1250,8 +1593,11 @@ expect {{
         print(f"\nInterrupted!" + (f" Cleaning up partial /tmp/{pf} in container..." if pf else ""))
         try:
             if sh is not None:
-                sh.send('\x03')
-                time.sleep(1)
+                try:
+                    sh.send('\x03')
+                    time.sleep(1)
+                except KeyboardInterrupt:
+                    pass
                 if pf and cn:
                     try:
                         sh.send(f"docker exec {cn} rm -f /tmp/{pf}\n")
@@ -1263,6 +1609,8 @@ expect {{
                 sh.close()
             if sc is not None:
                 sc.close()
+        except KeyboardInterrupt:
+            pass
         except Exception as e:
             print(f"(cleanup best-effort failed: {e})")
         sys.exit(0)
@@ -1357,58 +1705,42 @@ if __name__ == "__main__":
             temp_ssh.connect(device_host, username=device_user, password=device_pass, timeout=10)
             
             deployment = detect_deployment_type(temp_ssh)
-            
-            # Auto-detect NCP if cluster
-            if deployment == 'cluster':
-                ncp = detect_ncp_from_port_mirroring(temp_ssh)
-                if not ncp:
-                    print("\nNCP auto-detection failed. Please enter manually.")
-                    ncp = input("Which NCP number? (e.g., 0, 1, 2, 6, 18): ").strip() or "0"
-            
             temp_ssh.close()
             
             if not deployment:
                 print("\n⚠ Could not auto-detect system type")
-                print("Deployment type:")
-                print("  1. Standalone")
-                print("  2. Cluster")
-                deployment_choice = input("Select (1=Standalone, 2=Cluster): ").strip()
-                deployment = 'cluster' if deployment_choice == '2' else 'standalone'
-                
-                if deployment == 'cluster':
-                    ncp = input("Which NCP number? (e.g., 0, 1, 2, 6, 18): ").strip() or "0"
+                deployment = prompt_deployment_type()
             
         except Exception as e:
             print(f"\n⚠ Auto-detection failed: {e}")
-            print("Deployment type:")
-            print("  1. Standalone")
-            print("  2. Cluster")
-            deployment_choice = input("Select (1=Standalone, 2=Cluster): ").strip()
-            deployment = 'cluster' if deployment_choice == '2' else 'standalone'
-            
-            if deployment == 'cluster':
-                ncp = input("Which NCP number? (e.g., 0, 1, 2, 6, 18): ").strip() or "0"
+            deployment = prompt_deployment_type()
         
-        # Ask Datapath or Routing Engine
-        print("\nCapture from:")
-        print("  1. Datapath")
-        print("  2. Routing Engine")
-        mode_choice = input("Select (1=Datapath, 2=Routing Engine): ").strip()
-        mode = 'routing' if mode_choice == '2' else 'datapath'
+        # Capture source before NCP detection (NCP only applies to datapath)
+        mode = prompt_capture_mode()
         
-        # Set NCP if not already set
-        if mode == 'datapath' and deployment == 'standalone':
-            ncp = '0'
-        elif mode != 'datapath':
+        if mode == 'datapath':
+            ncp = resolve_ncp_for_datapath(device_host, device_user, device_pass, deployment)
+        else:
             ncp = None
         
         # Save settings
         save_settings(mode, deployment, ncp, device_host, device_user, device_pass)
     
+    # Dev VM for upload/download (prompt once if not in env / ~/.dn_qa_env / saved)
+    server_path = SERVER_PATH_DATAPATH if mode != 'routing' else SERVER_PATH_ROUTING
+    server_config = resolve_server_config(server_path)
+    if not server_config.get('server_pass'):
+        print("\nERROR: Dev VM password is required for pcap upload.")
+        print("Set DN_SERVER_PASSWORD or DN_DEV_VM_PASSWORD, or re-run and enter it when prompted.")
+        sys.exit(1)
+    print(f"\nUpload target: {server_config['server_user']}@{server_config['server_host']}:{server_path}/")
+    ensure_server_staging_dir(server_config)
+    
     # Call appropriate capture function with credentials
     if mode == 'routing':
         # Routing engine (works same for both standalone and cluster)
-        routing_engine_capture(device_host, device_user, device_pass)
+        routing_engine_capture(device_host, device_user, device_pass, server_config)
     else:
         # Datapath (standalone with NCP 0, or cluster with auto-detected NCP)
-        datapath_capture(device_host, device_user, device_pass, deployment, ncp)
+        datapath_capture(device_host, device_user, device_pass, deployment, ncp,
+                         server_config)
