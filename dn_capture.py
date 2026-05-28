@@ -17,6 +17,14 @@ DEFAULT_SERVER_USER = "dn"
 SERVER_PATH_DATAPATH = "/home/dn/capture"
 SERVER_PATH_ROUTING = "/home/dn"
 
+# Locked team upload target. This is the SAME for every user of the script —
+# users do NOT have upload accounts on each other's per-user dev VMs, so all
+# captures are funneled to a single team staging machine. Override password
+# only (DN_SERVER_PASSWORD env var) if the team password ever rotates.
+TEAM_UPLOAD_HOST = "zkeiserman-dev"
+TEAM_UPLOAD_USER = "dn"
+TEAM_UPLOAD_PASSWORD_DEFAULT = "Drive1234!"
+
 # Maximum pcap size (MB). Capture is stopped early when the file on the device
 # crosses this threshold so a runaway capture cannot fill /tmp and break the
 # device's CLI. Override at runtime: DN_MAX_PCAP_MB=20480 python3 dn_capture.py ...
@@ -35,7 +43,7 @@ MIN_FREE_GB = int(os.environ.get("DN_MIN_FREE_GB", "15"))
 #   dn@zkeiserman-dev:/home/dn/dn_capture_CHANGELOG.txt
 # Disable the check entirely by exporting DN_SKIP_UPDATE_CHECK=1.
 # ---------------------------------------------------------------------------
-__version__ = "2026.05.28.1"
+__version__ = "2026.05.28.2"
 UPDATE_SERVER = os.environ.get("DN_SERVER_HOST", "zkeiserman-dev")
 UPDATE_USER = "dn"
 UPDATE_PASS = os.environ.get("DN_SERVER_PASSWORD", "")
@@ -269,52 +277,29 @@ def reset_server_config():
 
 
 def resolve_server_config(server_path, prompt_if_missing=True):
-    """Dev VM used for device->server scp and Mac download. Never hardcodes passwords."""
+    """Dev VM upload target. Locked to the team staging server `zkeiserman-dev`
+    for ALL users — per-user dev VM overrides are intentionally NOT honoured
+    because team members don't have upload accounts on each other's machines.
+    Only the password is looked up dynamically (env -> saved cache -> default
+    `Drive1234!`)."""
     _load_dotenv_file(DN_QA_ENV)
 
-    saved = load_server_config_from_file()
-    saved_host = saved.get('server_host') or ""
-    # Treat a cached host that looks like junk (e.g. a password mistyped into
-    # the host prompt on a previous run) as if it were never set, so we
-    # re-prompt instead of silently reusing garbage forever.
-    if saved_host and not _is_valid_host(saved_host):
-        print(f"Ignoring invalid cached dev VM host: {saved_host!r}")
-        saved_host = ""
+    # Hard-locked team values — no env, no cache, no prompt for these.
+    host = TEAM_UPLOAD_HOST
+    user = TEAM_UPLOAD_USER
 
-    host = (os.environ.get("DN_SERVER_HOST") or
-            os.environ.get("DN_DEV_VM_HOST") or
-            saved_host or "")
+    saved = load_server_config_from_file()
     password = (os.environ.get("DN_SERVER_PASSWORD") or
                 os.environ.get("DN_DEV_VM_PASSWORD") or
-                saved.get('server_pass') or "")
-    user = (os.environ.get("DN_SERVER_USER") or
-            os.environ.get("DN_DEV_VM_USER") or
-            saved.get('server_user') or
-            DEFAULT_SERVER_USER)
+                saved.get('server_pass') or
+                TEAM_UPLOAD_PASSWORD_DEFAULT)
 
-    if host and not _is_valid_host(host):
-        # Env-var override is bogus too; force a prompt.
-        print(f"Ignoring invalid DN_SERVER_HOST/DN_DEV_VM_HOST value: {host!r}")
-        host = ""
-
-    if prompt_if_missing and not host:
-        default_host = UPDATE_SERVER if _is_valid_host(UPDATE_SERVER) else "zkeiserman-dev"
-        for _ in range(3):
-            entered = input(f"\nDev VM for pcap upload [{default_host}]: ").strip() or default_host
-            if _is_valid_host(entered):
-                host = entered
-                break
-            print(f"  '{entered}' does not look like a hostname. "
-                  "Allowed chars: letters, digits, '.', '_', '-'. Try again.")
-        else:
-            print("Giving up after 3 invalid attempts. Re-run when ready.")
-            sys.exit(1)
-
-    if prompt_if_missing and not password:
-        print("Dev VM password (for scp from device; stored in ~/Downloads/dn_devices.json):")
-        password = getpass.getpass("Password: ") or ""
-
-    if host and password and _is_valid_host(host):
+    # If the previous cache had a stray host/user (from older versions of the
+    # script), refresh it with the locked team values so subsequent reads are
+    # correct. Best-effort; ignore errors.
+    cached_host = saved.get('server_host') or ""
+    cached_user = saved.get('server_user') or ""
+    if cached_host != host or cached_user != user:
         save_server_config(host, password, user)
 
     return {

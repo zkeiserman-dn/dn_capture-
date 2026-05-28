@@ -1,6 +1,18 @@
 DriveNets Fast Capture — CHANGELOG
 ==================================
 
+v2026.05.28.2  (2026-05-28)
+  * FIX: upload target is now LOCKED to dn@zkeiserman-dev:/home/dn/capture
+    for every user. Previously each Mac cached its own dev VM (e.g.
+    odahan02-dev, eduardhaimov-dev) as the target, which has no upload
+    account and so the scp failed with "Permission denied". The team
+    staging server is the only host with the right account + directory.
+    Old cached host/user values in ~/Downloads/dn_devices.json are
+    silently refreshed to the locked values on first run.
+  * Only the password is still env-var-overridable (DN_SERVER_PASSWORD)
+    in case the team password rotates. Defaults to Drive1234! so no
+    prompt is shown on a clean machine.
+
 v2026.05.28.1  (2026-05-28)
   * FIX: download from dev VM was hanging on a TTY password prompt when SSH
     keys are not set up. The keyless rsync attempt now runs with
